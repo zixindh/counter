@@ -55,34 +55,31 @@ st.title("💰 RMB Counter")
 
 # User Login Section
 if not st.session_state.logged_in:
-    # Center the login form
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        st.subheader("Enter your name")
-        
-        # Use form for Enter key submission
-        with st.form("login_form"):
-            username = st.text_input(
-                "Your name", 
-                placeholder="Type your name here...",
-                label_visibility="collapsed"
-            )
-            login_submitted = st.form_submit_button("Start counting", type="primary", use_container_width=True)
-            
-            if login_submitted:
-                if username.strip():
-                    st.session_state.logged_in = True
-                    st.session_state.current_user = username.strip()
-                    st.session_state.last_update = datetime.now()
-                    
-                    # Initialize new user with 0 if doesn't exist
-                    if username not in user_data:
-                        user_data[username] = 0
-                        save_data(user_data)
-                    st.rerun()
-                else:
-                    st.warning("Please enter your name")
+    st.subheader("Enter your name")
+
+    with st.form("login_form"):
+        username = st.text_input(
+            "Your name",
+            placeholder="Type your name here...",
+            label_visibility="collapsed",
+            key="login_username",
+        )
+        login_submitted = st.form_submit_button("Start counting", type="primary", use_container_width=True)
+
+    if login_submitted:
+        username = username.strip()
+        if username:
+            st.session_state.logged_in = True
+            st.session_state.current_user = username
+            st.session_state.last_update = datetime.now()
+
+            # Initialize new user with 0 if doesn't exist
+            if username not in user_data:
+                user_data[username] = 0
+                save_data(user_data)
+            st.rerun()
+        else:
+            st.warning("Please enter your name")
 
 # Main Counter Interface
 else:
