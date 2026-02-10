@@ -15,6 +15,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "user_data.json")
 LOCK_FILE = f"{DATA_FILE}.lock"
 
+def normalize_username(username):
+    """Normalize username so desktop/phone inputs map to one user."""
+    if not isinstance(username, str):
+        return ""
+    cleaned = " ".join(username.split())
+    return cleaned.casefold()
+
 def _normalize_data(data):
     """Keep only {username: non-negative int total} entries."""
     if not isinstance(data, dict):
@@ -22,10 +29,7 @@ def _normalize_data(data):
 
     normalized = {}
     for raw_name, raw_total in data.items():
-        if not isinstance(raw_name, str):
-            continue
-
-        name = raw_name.strip()
+        name = normalize_username(raw_name)
         if not name:
             continue
 
@@ -34,7 +38,8 @@ def _normalize_data(data):
         except (TypeError, ValueError):
             continue
 
-        normalized[name] = max(0, total)
+        # Merge legacy mixed-case keys into the same canonical user key.
+        normalized[name] = normalized.get(name, 0) + max(0, total)
 
     return normalized
 
@@ -85,7 +90,7 @@ def save_data(data):
 
 def ensure_user_exists(username):
     """Create user with 0 total if missing."""
-    username = username.strip()
+    username = normalize_username(username)
     if not username:
         return False
 
@@ -99,7 +104,7 @@ def ensure_user_exists(username):
 
 def update_user_total(username, delta=0, absolute_total=None):
     """Update user total using a lock-guarded read-modify-write."""
-    username = username.strip()
+    username = normalize_username(username)
     if not username:
         return None
 
@@ -124,6 +129,8 @@ def initialize_session_state():
         st.session_state.logged_in = False
     if 'current_user' not in st.session_state:
         st.session_state.current_user = ""
+    if 'current_user_display' not in st.session_state:
+        st.session_state.current_user_display = ""
     if 'last_update' not in st.session_state:
         st.session_state.last_update = None
     if 'confirm_reset' not in st.session_state:
@@ -157,11 +164,13 @@ if not st.session_state.logged_in:
         login_submitted = st.form_submit_button("Start counting", type="primary", use_container_width=True)
 
     if login_submitted:
-        username = username.strip()
-        if username:
-            if ensure_user_exists(username):
+        display_name = " ".join(username.split())
+        username_key = normalize_username(username)
+        if username_key:
+            if ensure_user_exists(username_key):
                 st.session_state.logged_in = True
-                st.session_state.current_user = username
+                st.session_state.current_user = username_key
+                st.session_state.current_user_display = display_name
                 st.session_state.confirm_reset = False
                 st.session_state.last_update = datetime.now()
                 st.rerun()
@@ -172,20 +181,26 @@ if not st.session_state.logged_in:
 
 # Main Counter Interface
 else:
-    username = st.session_state.current_user
+    username = normalize_username(st.session_state.current_user)
+    if username != st.session_state.current_user:
+        st.session_state.current_user = username
+
+    display_name = st.session_state.current_user_display or username
     user_data = load_data()
     current_total = user_data.get(username, 0)
     
-    # User info header with auto-logout
-    col1, col2, col3 = st.columns([2, 1, 1])
+    # Keep total prominent on small screens too.
+    st.subheader(f"Hello, {display_name}!")
+    st.metric("Total", f"{current_total} RMB")
+    col1, col2 = st.columns(2)
     with col1:
-        st.subheader(f"Hello, {username}!")
+        if st.button("Refresh total", use_container_width=True):
+            st.rerun()
     with col2:
-        st.metric("Total", f"{current_total} RMB")
-    with col3:
         if st.button("Switch user", type="secondary", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.current_user = ""
+            st.session_state.current_user_display = ""
             st.session_state.confirm_reset = False
             st.rerun()
     
