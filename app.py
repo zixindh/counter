@@ -2,6 +2,7 @@ import streamlit as st
 import json
 import os
 import tempfile
+import time
 from datetime import datetime
 from contextlib import contextmanager
 
@@ -10,10 +11,16 @@ try:
 except ImportError:
     fcntl = None
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 # Configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "user_data.json")
 LOCK_FILE = f"{DATA_FILE}.lock"
+AUTO_SYNC_INTERVAL_MS = 3000
 
 def normalize_username(username):
     """Normalize username so desktop/phone inputs map to one user."""
@@ -143,6 +150,16 @@ def reset_user_data(username):
         return True
     return False
 
+def run_auto_sync():
+    """Keep desktop and phone sessions synced without manual refresh."""
+    if st_autorefresh is not None:
+        st_autorefresh(interval=AUTO_SYNC_INTERVAL_MS, key="counter_auto_sync")
+        return
+
+    # Fallback for environments where streamlit-autorefresh is unavailable.
+    time.sleep(AUTO_SYNC_INTERVAL_MS / 1000)
+    st.rerun()
+
 initialize_session_state()
 
 # App UI
@@ -192,17 +209,13 @@ else:
     # Keep total prominent on small screens too.
     st.subheader(f"Hello, {display_name}!")
     st.metric("Total", f"{current_total} RMB")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Refresh total", use_container_width=True):
-            st.rerun()
-    with col2:
-        if st.button("Switch user", type="secondary", use_container_width=True):
-            st.session_state.logged_in = False
-            st.session_state.current_user = ""
-            st.session_state.current_user_display = ""
-            st.session_state.confirm_reset = False
-            st.rerun()
+    if st.button("Switch user", type="secondary", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.current_user = ""
+        st.session_state.current_user_display = ""
+        st.session_state.confirm_reset = False
+        st.rerun()
+    st.caption("Auto-sync is on (updates every 3 seconds).")
     
     st.write("---")
     
@@ -285,6 +298,8 @@ else:
     # Last update timestamp (subtle)
     if st.session_state.last_update:
         st.caption(f"Last update: {st.session_state.last_update.strftime('%H:%M')}")
+
+    run_auto_sync()
 
 # Add some minimal styling
 st.markdown("""
