@@ -1,142 +1,209 @@
-import json
 import os
-import tempfile
-import time
-from contextlib import contextmanager
 from datetime import datetime
 
+import requests
 import streamlit as st
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
     st_autorefresh = None
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(BASE_DIR, "user_data.json")
-LOCK_FILE = f"{DATA_FILE}.lock"
+NOTION_DATABASE_ID = "35fa6041f59c80afa912dccefcfbd26a"
+NOTION_VERSION = "2022-06-28"
+NOTION_API_BASE = "https://api.notion.com/v1"
 AUTO_SYNC_INTERVAL_MS = 3000
-DEFAULT_USER = "me"
 
 
-@contextmanager
-def file_lock():
-    if fcntl is None:
-        yield
-        return
-
-    with open(LOCK_FILE, "w", encoding="utf-8") as lock_handle:
-        fcntl.flock(lock_handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_handle, fcntl.LOCK_UN)
-
-
-def load_total():
-    """Load just one running total for quick personal use."""
+def get_notion_token():
+    # Prefer Streamlit secret (set as `Notion_API` in Streamlit Cloud), fall back to env var.
     try:
-        if not os.path.exists(DATA_FILE):
-            return 0
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-
-        if isinstance(raw, dict):
-            # Backward compatibility with older multi-user format.
-            return max(0, int(raw.get(DEFAULT_USER, 0)))
-        return max(0, int(raw))
-    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-        return 0
+        if "Notion_API" in st.secrets:
+            return st.secrets["Notion_API"]
+    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+        pass
+    return os.environ.get("Notion_API") or os.environ.get("NOTION_API")
 
 
-def save_total(total):
-    temp_file_path = None
-    safe_total = max(0, int(total))
-
-    try:
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=BASE_DIR, encoding="utf-8") as tmp:
-            json.dump(safe_total, tmp)
-            temp_file_path = tmp.name
-        os.replace(temp_file_path, DATA_FILE)
-        return True
-    except Exception:
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        return False
+def notion_headers():
+    token = get_notion_token()
+    if not token:
+        return None
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
 
 
-def apply_delta(delta=0, absolute_total=None):
-    with file_lock():
-        current = load_total()
-        next_total = current + int(delta) if absolute_total is None else int(absolute_total)
-        next_total = max(0, next_total)
-        if save_total(next_total):
-            return next_total
-    return None
+def find_user_page(username):
+    """Return (page_id, amount) for the user, or (None, None) if missing."""
+    headers = notion_headers()
+    if headers is None:
+        return None, None
+    payload = {
+        "filter": {"property": "Name", "title": {"equals": username}},
+        "page_size": 1,
+    }
+    resp = requests.post(
+        f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query",
+        headers=headers,
+        json=payload,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    if not results:
+        return None, None
+    page = results[0]
+    amount = page["properties"].get("Amount", {}).get("number") or 0
+    return page["id"], int(amount)
+
+
+def create_user_page(username, amount=0):
+    headers = notion_headers()
+    payload = {
+        "parent": {"database_id": NOTION_DATABASE_ID},
+        "properties": {
+            "Name": {"title": [{"text": {"content": username}}]},
+            "Amount": {"number": int(amount)},
+        },
+    }
+    resp = requests.post(f"{NOTION_API_BASE}/pages", headers=headers, json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def update_page_amount(page_id, amount):
+    headers = notion_headers()
+    payload = {"properties": {"Amount": {"number": max(0, int(amount))}}}
+    resp = requests.patch(f"{NOTION_API_BASE}/pages/{page_id}", headers=headers, json=payload, timeout=10)
+    resp.raise_for_status()
+
+
+def get_or_create_user(username):
+    page_id, amount = find_user_page(username)
+    if page_id is None:
+        page_id = create_user_page(username, 0)
+        amount = 0
+    return page_id, amount
+
+
+def apply_delta(page_id, delta=0, absolute_total=None):
+    """Re-read from Notion before writing so concurrent updates from other devices don't get lost."""
+    headers = notion_headers()
+    resp = requests.get(f"{NOTION_API_BASE}/pages/{page_id}", headers=headers, timeout=10)
+    resp.raise_for_status()
+    current = int(resp.json()["properties"].get("Amount", {}).get("number") or 0)
+    next_total = current + int(delta) if absolute_total is None else int(absolute_total)
+    next_total = max(0, next_total)
+    update_page_amount(page_id, next_total)
+    return next_total
 
 
 def run_auto_sync():
     if st_autorefresh is not None:
         st_autorefresh(interval=AUTO_SYNC_INTERVAL_MS, key="counter_auto_sync")
-        return
-    time.sleep(AUTO_SYNC_INTERVAL_MS / 1000)
-    st.rerun()
 
-
-if "last_update" not in st.session_state:
-    st.session_state.last_update = None
 
 st.set_page_config(page_title="Savings", page_icon="💸", layout="centered")
-st.title("💸 Savings")
-st.caption("Quickly add or deduct money.")
 
-current_total = load_total()
+# Session defaults
+st.session_state.setdefault("username", None)
+st.session_state.setdefault("page_id", None)
+st.session_state.setdefault("last_update", None)
+
+if notion_headers() is None:
+    st.title("💸 Savings")
+    st.error(
+        "Notion API token is not configured. Add `Notion_API` to Streamlit secrets "
+        "(Streamlit Cloud → App settings → Secrets) or set the `Notion_API` environment variable."
+    )
+    st.stop()
+
+# --- Login screen ---
+if not st.session_state.username:
+    st.title("💸 Savings")
+    st.caption("Pick a username to start.")
+    with st.form("login_form"):
+        name = st.text_input("Username", max_chars=40, placeholder="e.g. alex")
+        submitted = st.form_submit_button("Continue", type="primary", use_container_width=True)
+    if submitted:
+        clean = (name or "").strip()
+        if not clean:
+            st.warning("Please enter a username.")
+        else:
+            try:
+                page_id, _ = get_or_create_user(clean)
+                st.session_state.username = clean
+                st.session_state.page_id = page_id
+                st.rerun()
+            except requests.HTTPError as exc:
+                st.error(f"Could not reach Notion: {exc.response.status_code} {exc.response.text}")
+            except requests.RequestException as exc:
+                st.error(f"Could not reach Notion: {exc}")
+    st.stop()
+
+# --- Main screen ---
+try:
+    _, current_total = find_user_page(st.session_state.username)
+    if current_total is None:
+        # Row got deleted in Notion — recreate.
+        st.session_state.page_id, current_total = get_or_create_user(st.session_state.username)
+except requests.RequestException as exc:
+    st.error(f"Sync failed: {exc}")
+    st.stop()
+
+header_cols = st.columns([3, 1])
+with header_cols[0]:
+    st.title("💸 Savings")
+    st.caption(f"Signed in as **{st.session_state.username}**")
+with header_cols[1]:
+    if st.button("Sign out", use_container_width=True):
+        st.session_state.username = None
+        st.session_state.page_id = None
+        st.rerun()
+
 st.metric("Current total", f"{current_total} RMB")
+
+
+def handle_change(delta=0, absolute_total=None):
+    try:
+        apply_delta(st.session_state.page_id, delta=delta, absolute_total=absolute_total)
+        st.session_state.last_update = datetime.now()
+        st.rerun()
+    except requests.RequestException as exc:
+        st.error(f"Could not save your update: {exc}")
+
 
 st.write("#### Quick actions")
 add_cols = st.columns(3)
 for amount, col in zip((10, 50, 100), add_cols):
     with col:
-        if st.button(f"+{amount}", type="primary", use_container_width=True):
-            if apply_delta(delta=amount) is not None:
-                st.session_state.last_update = datetime.now()
-                st.rerun()
+        if st.button(f"+{amount}", type="primary", use_container_width=True, key=f"add_{amount}"):
+            handle_change(delta=amount)
 
 sub_cols = st.columns(3)
 for amount, col in zip((10, 50, 100), sub_cols):
     with col:
-        if st.button(f"-{amount}", use_container_width=True):
-            if apply_delta(delta=-amount) is not None:
-                st.session_state.last_update = datetime.now()
-                st.rerun()
+        if st.button(f"-{amount}", use_container_width=True, key=f"sub_{amount}"):
+            handle_change(delta=-amount)
 
 with st.form("custom_form"):
     st.write("#### Custom")
     action = st.radio("Action", ["Add", "Deduct"], horizontal=True, label_visibility="collapsed")
     amount = st.number_input("Amount", min_value=1, max_value=100000, value=100, step=10)
     submitted = st.form_submit_button("Save", type="primary", use_container_width=True)
-
     if submitted:
         delta = int(amount) if action == "Add" else -int(amount)
-        if apply_delta(delta=delta) is not None:
-            st.session_state.last_update = datetime.now()
-            st.rerun()
-        else:
-            st.error("Could not save your update. Please try again.")
+        handle_change(delta=delta)
 
 if st.button("Reset to zero", use_container_width=True):
-    if apply_delta(absolute_total=0) is not None:
-        st.session_state.last_update = datetime.now()
-        st.rerun()
+    handle_change(absolute_total=0)
 
-st.caption("Auto-sync every 3 seconds.")
+st.caption("Synced with Notion — auto-refreshes every 3 seconds.")
 if st.session_state.last_update:
-    st.caption(f"Last update: {st.session_state.last_update.strftime('%H:%M')}")
+    st.caption(f"Last update: {st.session_state.last_update.strftime('%H:%M:%S')}")
 
 run_auto_sync()
 
