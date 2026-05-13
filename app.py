@@ -18,9 +18,10 @@ AUTO_SYNC_INTERVAL_MS = 3000
 def get_notion_token():
     # Prefer Streamlit secret (set as `Notion_API` in Streamlit Cloud), fall back to env var.
     try:
-        if "Notion_API" in st.secrets:
-            return st.secrets["Notion_API"]
-    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+        token = st.secrets.get("Notion_API")
+        if token:
+            return token
+    except Exception:
         pass
     return os.environ.get("Notion_API") or os.environ.get("NOTION_API")
 
@@ -154,16 +155,8 @@ except requests.RequestException as exc:
     st.error(f"Sync failed: {exc}")
     st.stop()
 
-header_cols = st.columns([3, 1])
-with header_cols[0]:
-    st.title("💸 Savings")
-    st.caption(f"Signed in as **{st.session_state.username}**")
-with header_cols[1]:
-    if st.button("Sign out", use_container_width=True):
-        st.session_state.username = None
-        st.session_state.page_id = None
-        st.rerun()
-
+st.title("💸 Savings")
+st.caption(f"Signed in as **{st.session_state.username}**")
 st.metric("Current total", f"{current_total} RMB")
 
 
@@ -201,6 +194,11 @@ with st.form("custom_form"):
 if st.button("Reset to zero", use_container_width=True):
     handle_change(absolute_total=0)
 
+if st.button("Sign out", use_container_width=True):
+    st.session_state.username = None
+    st.session_state.page_id = None
+    st.rerun()
+
 st.caption("Synced with Notion — auto-refreshes every 3 seconds.")
 if st.session_state.last_update:
     st.caption(f"Last update: {st.session_state.last_update.strftime('%H:%M:%S')}")
@@ -210,7 +208,7 @@ run_auto_sync()
 st.markdown(
     """
 <style>
-.block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 520px;}
+.block-container {padding-top: 3rem; padding-bottom: 2rem; max-width: 520px;}
 .stMetric {border: 1px solid #E6E6E6; border-radius: 14px; padding: 0.35rem;}
 .stButton button {border-radius: 10px; border: 1px solid #E5E7EB;}
 </style>
