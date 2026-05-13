@@ -61,6 +61,33 @@ def find_user_page(username):
     return page["id"], int(amount)
 
 
+def list_users():
+    """Return [(name, page_id), ...] for all rows in the Counter database."""
+    headers = notion_headers()
+    if headers is None:
+        return []
+    users = []
+    payload = {"page_size": 100, "sorts": [{"property": "Name", "direction": "ascending"}]}
+    while True:
+        resp = requests.post(
+            f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query",
+            headers=headers,
+            json=payload,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for page in data.get("results", []):
+            title = page["properties"].get("Name", {}).get("title", [])
+            name = "".join(part.get("plain_text", "") for part in title).strip()
+            if name:
+                users.append((name, page["id"]))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data["next_cursor"]
+    return users
+
+
 def create_user_page(username, amount=0):
     headers = notion_headers()
     payload = {
@@ -125,14 +152,36 @@ if notion_headers() is None:
 # --- Login screen ---
 if not st.session_state.username:
     st.title("💸 Savings")
-    st.caption("Pick a username to start.")
-    with st.form("login_form"):
-        name = st.text_input("Username", max_chars=40, placeholder="e.g. alex")
-        submitted = st.form_submit_button("Continue", type="primary", use_container_width=True)
+
+    try:
+        existing_users = list_users()
+    except requests.RequestException as exc:
+        st.error(f"Could not reach Notion: {exc}")
+        st.stop()
+
+    if existing_users:
+        st.caption("Tap your name to continue.")
+        # Two columns to keep buttons compact on phones.
+        cols = st.columns(2)
+        for idx, (name, page_id) in enumerate(existing_users):
+            if cols[idx % 2].button(name, key=f"user_{page_id}", use_container_width=True):
+                st.session_state.username = name
+                st.session_state.page_id = page_id
+                st.rerun()
+        st.divider()
+        st.caption("First time here? Add yourself below.")
+    else:
+        st.caption("No users yet — add yourself to get started.")
+
+    with st.form("new_user_form", clear_on_submit=True):
+        name = st.text_input("New username", max_chars=40, placeholder="e.g. alex")
+        submitted = st.form_submit_button("Create & continue", type="primary", use_container_width=True)
     if submitted:
         clean = (name or "").strip()
         if not clean:
             st.warning("Please enter a username.")
+        elif any(clean.lower() == u.lower() for u, _ in existing_users):
+            st.warning("That name already exists — tap it above instead.")
         else:
             try:
                 page_id, _ = get_or_create_user(clean)
