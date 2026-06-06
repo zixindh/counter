@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from datetime import datetime
 
 import requests
@@ -9,10 +11,85 @@ try:
 except ImportError:
     st_autorefresh = None
 
+st.set_page_config(page_title="Savings", page_icon="💸", layout="centered")
+
 NOTION_DATABASE_ID = "35fa6041f59c80afa912dccefcfbd26a"
 NOTION_VERSION = "2022-06-28"
 NOTION_API_BASE = "https://api.notion.com/v1"
-AUTO_SYNC_INTERVAL_MS = 3000
+AUTO_SYNC_INTERVAL_MS = 15000
+
+
+class LatestAmountSyncer:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.workers = set()
+        self.errors = {}
+        self.saved_at = {}
+
+    def queue(self, page_id, amount, headers):
+        start_worker = False
+        with self.lock:
+            self.pending[page_id] = {
+                "amount": int(amount),
+                "headers": dict(headers),
+                "changed_at": time.monotonic(),
+            }
+            self.errors.pop(page_id, None)
+            if page_id not in self.workers:
+                self.workers.add(page_id)
+                start_worker = True
+
+        if start_worker:
+            thread = threading.Thread(target=self._write_latest, args=(page_id,), daemon=True)
+            thread.start()
+
+    def has_pending(self, page_id):
+        with self.lock:
+            return page_id in self.pending
+
+    def status(self, page_id):
+        with self.lock:
+            return self.errors.get(page_id), self.saved_at.get(page_id)
+
+    def _write_latest(self, page_id):
+        while True:
+            time.sleep(0.35)
+            with self.lock:
+                pending = self.pending.get(page_id)
+                if pending is None:
+                    self.workers.discard(page_id)
+                    return
+                if time.monotonic() - pending["changed_at"] < 0.35:
+                    continue
+                amount = pending["amount"]
+                headers = pending["headers"]
+                changed_at = pending["changed_at"]
+
+            try:
+                patch_page_amount(page_id, amount, headers)
+            except requests.RequestException as exc:
+                with self.lock:
+                    pending = self.pending.get(page_id)
+                    if pending is not None and pending["changed_at"] == changed_at:
+                        self.errors[page_id] = str(exc)
+                        self.pending.pop(page_id, None)
+                        self.workers.discard(page_id)
+                        return
+                continue
+
+            with self.lock:
+                pending = self.pending.get(page_id)
+                if pending is not None and pending["changed_at"] == changed_at:
+                    self.saved_at[page_id] = datetime.now()
+                    self.pending.pop(page_id, None)
+                    self.workers.discard(page_id)
+                    return
+
+
+@st.cache_resource
+def get_syncer():
+    return LatestAmountSyncer()
 
 
 def get_notion_token():
@@ -57,12 +134,23 @@ def find_user_page(username):
     if not results:
         return None, None
     page = results[0]
-    amount = page["properties"].get("Amount", {}).get("number") or 0
+    amount = page_amount(page)
     return page["id"], int(amount)
 
 
+def page_amount(page):
+    return int(page["properties"].get("Amount", {}).get("number") or 0)
+
+
+def fetch_page_amount(page_id):
+    headers = notion_headers()
+    resp = requests.get(f"{NOTION_API_BASE}/pages/{page_id}", headers=headers, timeout=10)
+    resp.raise_for_status()
+    return page_amount(resp.json())
+
+
 def list_users():
-    """Return [(name, page_id), ...] for all rows in the Counter database."""
+    """Return [(name, page_id, amount), ...] for all rows in the Counter database."""
     headers = notion_headers()
     if headers is None:
         return []
@@ -81,7 +169,7 @@ def list_users():
             title = page["properties"].get("Name", {}).get("title", [])
             name = "".join(part.get("plain_text", "") for part in title).strip()
             if name:
-                users.append((name, page["id"]))
+                users.append((name, page["id"], page_amount(page)))
         if not data.get("has_more"):
             break
         payload["start_cursor"] = data["next_cursor"]
@@ -102,8 +190,7 @@ def create_user_page(username, amount=0):
     return resp.json()["id"]
 
 
-def update_page_amount(page_id, amount):
-    headers = notion_headers()
+def patch_page_amount(page_id, amount, headers):
     payload = {"properties": {"Amount": {"number": max(0, int(amount))}}}
     resp = requests.patch(f"{NOTION_API_BASE}/pages/{page_id}", headers=headers, json=payload, timeout=10)
     resp.raise_for_status()
@@ -117,29 +204,18 @@ def get_or_create_user(username):
     return page_id, amount
 
 
-def apply_delta(page_id, delta=0, absolute_total=None):
-    """Re-read from Notion before writing so concurrent updates from other devices don't get lost."""
-    headers = notion_headers()
-    resp = requests.get(f"{NOTION_API_BASE}/pages/{page_id}", headers=headers, timeout=10)
-    resp.raise_for_status()
-    current = int(resp.json()["properties"].get("Amount", {}).get("number") or 0)
-    next_total = current + int(delta) if absolute_total is None else int(absolute_total)
-    next_total = max(0, next_total)
-    update_page_amount(page_id, next_total)
-    return next_total
-
-
 def run_auto_sync():
     if st_autorefresh is not None:
-        st_autorefresh(interval=AUTO_SYNC_INTERVAL_MS, key="counter_auto_sync")
-
-
-st.set_page_config(page_title="Savings", page_icon="💸", layout="centered")
+        return st_autorefresh(interval=AUTO_SYNC_INTERVAL_MS, key="counter_auto_sync")
+    return None
 
 # Session defaults
 st.session_state.setdefault("username", None)
 st.session_state.setdefault("page_id", None)
+st.session_state.setdefault("current_total", None)
 st.session_state.setdefault("last_update", None)
+st.session_state.setdefault("last_auto_sync_count", -1)
+st.session_state.setdefault("save_error", None)
 
 if notion_headers() is None:
     st.title("💸 Savings")
@@ -163,10 +239,11 @@ if not st.session_state.username:
         st.caption("Tap your name to continue.")
         # Two columns to keep buttons compact on phones.
         cols = st.columns(2)
-        for idx, (name, page_id) in enumerate(existing_users):
+        for idx, (name, page_id, amount) in enumerate(existing_users):
             if cols[idx % 2].button(name, key=f"user_{page_id}", use_container_width=True):
                 st.session_state.username = name
                 st.session_state.page_id = page_id
+                st.session_state.current_total = amount
                 st.rerun()
         st.divider()
         st.caption("First time here? Add yourself below.")
@@ -180,13 +257,14 @@ if not st.session_state.username:
         clean = (name or "").strip()
         if not clean:
             st.warning("Please enter a username.")
-        elif any(clean.lower() == u.lower() for u, _ in existing_users):
+        elif any(clean.lower() == u.lower() for u, _, _ in existing_users):
             st.warning("That name already exists — tap it above instead.")
         else:
             try:
                 page_id, _ = get_or_create_user(clean)
                 st.session_state.username = clean
                 st.session_state.page_id = page_id
+                st.session_state.current_total = 0
                 st.rerun()
             except requests.HTTPError as exc:
                 st.error(f"Could not reach Notion: {exc.response.status_code} {exc.response.text}")
@@ -195,64 +273,119 @@ if not st.session_state.username:
     st.stop()
 
 # --- Main screen ---
-try:
-    _, current_total = find_user_page(st.session_state.username)
-    if current_total is None:
-        # Row got deleted in Notion — recreate.
-        st.session_state.page_id, current_total = get_or_create_user(st.session_state.username)
-except requests.RequestException as exc:
-    st.error(f"Sync failed: {exc}")
-    st.stop()
+syncer = get_syncer()
+auto_sync_count = run_auto_sync()
+should_sync = st.session_state.current_total is None
+if auto_sync_count is not None and auto_sync_count > 0 and auto_sync_count != st.session_state.last_auto_sync_count:
+    st.session_state.last_auto_sync_count = auto_sync_count
+    should_sync = not syncer.has_pending(st.session_state.page_id)
+
+if should_sync:
+    try:
+        st.session_state.current_total = fetch_page_amount(st.session_state.page_id)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            # Row got deleted in Notion — recreate.
+            st.session_state.page_id, st.session_state.current_total = get_or_create_user(
+                st.session_state.username
+            )
+        else:
+            st.error(f"Sync failed: {exc}")
+            st.stop()
+    except requests.RequestException as exc:
+        st.error(f"Sync failed: {exc}")
+        st.stop()
+
+current_total = st.session_state.current_total
+
+
+def handle_change(delta=0, absolute_total=None):
+    previous_total = int(st.session_state.current_total or 0)
+    next_total = previous_total + int(delta) if absolute_total is None else int(absolute_total)
+    next_total = max(0, next_total)
+    st.session_state.current_total = next_total
+    st.session_state.last_update = datetime.now()
+
+    headers = notion_headers()
+    if headers is None:
+        st.session_state.save_error = "Could not save your update: Notion API token is not configured."
+    else:
+        get_syncer().queue(st.session_state.page_id, next_total, headers)
+        st.session_state.save_error = None
+
+
+def handle_custom_change():
+    amount = int(st.session_state.custom_amount)
+    delta = amount if st.session_state.custom_action == "Add" else -amount
+    handle_change(delta=delta)
+
 
 st.title("💸 Savings")
 st.caption(f"Signed in as **{st.session_state.username}**")
 st.metric("Current total", f"{current_total} RMB")
-
-
-def handle_change(delta=0, absolute_total=None):
-    try:
-        apply_delta(st.session_state.page_id, delta=delta, absolute_total=absolute_total)
-        st.session_state.last_update = datetime.now()
-        st.rerun()
-    except requests.RequestException as exc:
-        st.error(f"Could not save your update: {exc}")
+sync_error, last_saved_at = syncer.status(st.session_state.page_id)
+if st.session_state.save_error or sync_error:
+    st.error(st.session_state.save_error or f"Could not save your update: {sync_error}")
 
 
 st.write("#### Quick actions")
 add_cols = st.columns(3)
 for amount, col in zip((10, 50, 100), add_cols):
     with col:
-        if st.button(f"+{amount}", type="primary", use_container_width=True, key=f"add_{amount}"):
-            handle_change(delta=amount)
+        st.button(
+            f"+{amount}",
+            type="primary",
+            use_container_width=True,
+            key=f"add_{amount}",
+            on_click=handle_change,
+            kwargs={"delta": amount},
+        )
 
 sub_cols = st.columns(3)
 for amount, col in zip((10, 50, 100), sub_cols):
     with col:
-        if st.button(f"-{amount}", use_container_width=True, key=f"sub_{amount}"):
-            handle_change(delta=-amount)
+        st.button(
+            f"-{amount}",
+            use_container_width=True,
+            key=f"sub_{amount}",
+            on_click=handle_change,
+            kwargs={"delta": -amount},
+        )
 
 with st.form("custom_form"):
     st.write("#### Custom")
-    action = st.radio("Action", ["Add", "Deduct"], horizontal=True, label_visibility="collapsed")
-    amount = st.number_input("Amount", min_value=1, max_value=100000, value=100, step=10)
-    submitted = st.form_submit_button("Save", type="primary", use_container_width=True)
-    if submitted:
-        delta = int(amount) if action == "Add" else -int(amount)
-        handle_change(delta=delta)
+    st.radio(
+        "Action",
+        ["Add", "Deduct"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="custom_action",
+    )
+    st.number_input("Amount", min_value=1, max_value=100000, value=100, step=10, key="custom_amount")
+    st.form_submit_button(
+        "Save",
+        type="primary",
+        use_container_width=True,
+        on_click=handle_custom_change,
+    )
 
-if st.button("Reset to zero", use_container_width=True):
-    handle_change(absolute_total=0)
+st.button("Reset to zero", use_container_width=True, on_click=handle_change, kwargs={"absolute_total": 0})
 
 if st.button("Sign out", use_container_width=True):
     st.session_state.username = None
     st.session_state.page_id = None
+    st.session_state.current_total = None
+    st.session_state.last_auto_sync_count = -1
+    st.session_state.save_error = None
     st.rerun()
 
-st.caption("Synced with Notion — auto-refreshes every 3 seconds.")
-if st.session_state.last_update:
+st.caption("Synced with Notion — auto-refreshes every 15 seconds.")
+if syncer.has_pending(st.session_state.page_id):
+    st.caption("Saving to Notion...")
+elif last_saved_at:
+    st.caption(f"Saved to Notion: {last_saved_at.strftime('%H:%M:%S')}")
+elif st.session_state.last_update:
     st.caption(f"Last update: {st.session_state.last_update.strftime('%H:%M:%S')}")
-
-run_auto_sync()
 
 st.markdown(
     """

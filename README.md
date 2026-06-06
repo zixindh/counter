@@ -10,4 +10,4 @@
 - **Run**:
   - `pip install -r requirements.txt`
   - `streamlit run app.py`
-- **Sync**: Auto-refresh every 3 seconds pulls the latest amount from Notion. Each write re-reads first to minimize lost updates between devices.
+- **Sync**: Button taps update the on-screen total immediately. The app writes the latest total to Notion in the background and still refreshes from Notion every 15 seconds for cross-device changes.
